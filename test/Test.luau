@@ -65,6 +65,8 @@ local function MockTypeof(a: any)
 	return TypeofA
 end
 
+local ModuleCache = {}
+
 local function MockRequire(Path: string, Environment)
 	local Source = fs.readFile(Path)
 	local Bytecode = luau.compile(Source, {
@@ -75,8 +77,19 @@ local function MockRequire(Path: string, Environment)
 	Environment._G = {}
 	Environment.task = task
 	Environment.typeof = MockTypeof
-	Environment.require = function()
-		error("require is not supported")
+	Environment.require = function(Module)
+		local ModulePath = type(Module) == "table" and Module.__path
+		if not ModulePath then
+			error("require is not supported")
+		end
+
+		if ModuleCache[ModulePath] == nil then
+			local ModuleEnvironment = table.clone(Environment)
+			ModuleEnvironment.script = Module
+			ModuleCache[ModulePath] = MockRequire(ModulePath, ModuleEnvironment)
+		end
+
+		return ModuleCache[ModulePath]
 	end
 
 	local Execute = luau.load(Bytecode, {
@@ -87,14 +100,35 @@ local function MockRequire(Path: string, Environment)
 	return Execute()
 end
 
-local Client: typeof(require("../Network/Client")) = MockRequire("../Network/Client.luau", {
+local function MockFolder(Directory: string)
+	local Folder = {}
+
+	function Folder.FindFirstChild(_, Name: string)
+		local ChildPath = `{Directory}/{Name}.luau`
+		if fs.isFile(ChildPath) then
+			return { __path = ChildPath, Parent = Folder }
+		end
+
+		return nil
+	end
+
+	Folder.types = { __path = `{Directory}/types.luau`, Parent = Folder }
+	return Folder
+end
+
+local function MockModule(Directory: string, Environment)
+	Environment.script = MockFolder(Directory)
+	return MockRequire(`{Directory}/init.luau`, Environment)
+end
+
+local Client: typeof(require("../Network/Client")) = MockModule("../Network/Client", {
 	game = ClientEnvironment.game,
 	Color3 = ClientEnvironment.Color3,
 	DateTime = ClientEnvironment.DateTime,
 	BrickColor = ClientEnvironment.BrickColor,
 })
 
-local Server: typeof(require("../Network/Server")) = MockRequire("../Network/Server.luau", {
+local Server: typeof(require("../Network/Server")) = MockModule("../Network/Server", {
 	game = ServerEnvironment.game,
 	Color3 = ServerEnvironment.Color3,
 	DateTime = ServerEnvironment.DateTime,

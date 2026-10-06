@@ -15,7 +15,7 @@ type Generate = (
 	WriteValidations: boolean?
 ) -> ()
 
-type TypePrefab = {
+export type TypePrefab = {
 	Read: Reader,
 	Write: Writer,
 }
@@ -31,6 +31,7 @@ type AssertGenerator = (Variable: string, ...any) -> AssertPrefab
 local SEND_BUFFER = "SendBuffer"
 local RECIEVE_BUFFER = "RecieveBuffer"
 local SEND_POSITION = "SendOffset"
+local RECIEVE_CURSOR = "RecieveCursor"
 
 local BYTE = 1
 local SHORT = 2
@@ -317,7 +318,8 @@ do
 			local LengthType = GetTypeToUse(Upper)
 
 			LengthType.Read("Length", Block)
-			Block:Line(`{Block:Declare(Variable)} = buffer.readstring({RECIEVE_BUFFER}, Read(Length), Length)`)
+			Block:Line(`{Block:Declare(Variable)} = buffer.readstring({RECIEVE_BUFFER}, {RECIEVE_CURSOR}, Length)`)
+			Block:Line(`{RECIEVE_CURSOR} += Length`)
 		end,
 		Write = function(Value: string, Block: Block, Range: NumberRange?)
 			if Range and Range.Min == Range.Max then
@@ -330,7 +332,7 @@ do
 
 			Block:Line(`local Length = #{Value}`)
 			LengthType.Write("Length", Block)
-			Block:Line(`Allocate(Length)`)
+			Block:Line(`{SEND_POSITION}, {SEND_BUFFER} = Allocate(Length)`)
 			Block:Line(`buffer.writestring({SEND_BUFFER}, {SEND_POSITION}, {Value}, Length)`)
 		end,
 	}
@@ -389,7 +391,8 @@ do
 			local LengthType = GetTypeToUse(Upper)
 			LengthType.Read("Length", Block)
 			Block:Line(`{Block:Declare(Variable)} = buffer.create(Length)`)
-			Block:Line(`buffer.copy({Variable}, 0, {RECIEVE_BUFFER}, Read(Length), Length)`)
+			Block:Line(`buffer.copy({Variable}, 0, {RECIEVE_BUFFER}, {RECIEVE_CURSOR}, Length)`)
+			Block:Line(`{RECIEVE_CURSOR} += Length`)
 		end,
 		Write = function(Value: string, Block: Block, Range: NumberRange?)
 			if Range and Range.Min == Range.Max then
@@ -401,7 +404,7 @@ do
 			local LengthType = GetTypeToUse(Upper)
 			Block:Line(`local Length = buffer.len({Value})`)
 			LengthType.Write("Length", Block)
-			Block:Line(`Allocate(Length)`)
+			Block:Line(`{SEND_POSITION}, {SEND_BUFFER} = Allocate(Length)`)
 			Block:Line(`buffer.copy({SEND_BUFFER}, {SEND_POSITION}, {Value}, 0, Length)`)
 		end,
 	}

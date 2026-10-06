@@ -31,6 +31,8 @@ type Node<Type, Body, Tokens> = {
 	Name: string,
 	Value: Body,
 	Tokens: Tokens,
+	--> Scope qualified name of the declaration this node references, nil for inline and generic types
+	Reference: string?,
 }
 
 type Generics = {
@@ -42,6 +44,7 @@ type Generics = {
 type Reference = {
 	Name: Token,
 	To: TypeNode,
+	Scope: Scope,
 }
 
 export type Scope = {
@@ -177,6 +180,7 @@ export type Function = Node<"Function", {
 export type ScopeNode = Node<"Scope", {
 	Scope: Scope,
 	Values: { Declaration },
+	Import: boolean?,
 }, {}>
 
 ---- Settings ----
@@ -492,6 +496,17 @@ end
 
 ---- Utility Parsing Functions ----
 
+--> Mirrors the generator's export naming so references resolve to the emitted luau type name
+local function GetQualifiedName(Name: string, Scope: Scope?): string
+	local Prefix = ""
+	while Scope and Scope.Name.Value ~= "" do
+		Prefix = `{Scope.Name.Value}_{Prefix}`
+		Scope = Scope.Parent
+	end
+
+	return `{Prefix}{Name}`
+end
+
 function Parser.Reference(self: Parser, Bucket: Bucket, Identifier: string): (Scope | Reference)?
 	local Path = string.split(Identifier, ".")
 	local Scope: Scope? = self.Scope
@@ -543,6 +558,7 @@ function Parser.SetReference(self: Parser, Bucket: Bucket, Identifier: Token, De
 	self.Scope.Symbols[Bucket][Name] = {
 		To = Declaration,
 		Name = Identifier,
+		Scope = self.Scope,
 	} :: Reference
 end
 
@@ -770,6 +786,7 @@ function Parser.ReplaceGenerics(self: Parser, Of: TypeNode, Previous: { [string]
 			Generic.Type = Replacement.Type
 			Generic.Value = Replacement.Value
 			Generic.Tokens = Replacement.Tokens
+			Generic.Reference = Replacement.Reference
 		end
 
 		if Index < #Generics.List then
@@ -799,6 +816,7 @@ function Parser.ReplaceGenerics(self: Parser, Of: TypeNode, Previous: { [string]
 			Type.Type = Replacement.Type
 			Type.Value = Replacement.Value
 			Type.Tokens = Replacement.Tokens
+			Type.Reference = Replacement.Reference
 		end
 	end
 
@@ -917,6 +935,7 @@ function Parser.Import(self: Parser): ScopeNode
 		Value = {
 			Scope = Scope,
 			Values = AST.Value.Declarations,
+			Import = true,
 		},
 		Tokens = {},
 	}
@@ -1698,6 +1717,9 @@ function Parser.Declaration(self: Parser, Name: Token): TypeNode
 
 	if GENERICS_TYPES[To.Type] and To.Value.Generics then
 		To = self:ReplaceGenerics(To)
+		To.Reference = nil
+	else
+		To.Reference = GetQualifiedName(Reference.Name.Value, Reference.Scope)
 	end
 
 	return To

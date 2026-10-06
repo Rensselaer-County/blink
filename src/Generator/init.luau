@@ -21,6 +21,18 @@ local Sources = {
 }
 
 local EVENTS_TYPE = "BLINK_EVENTS_SYMBOL"
+
+--> Client and server require their own copy of the shared types as a child module named TYPES_CHILD
+local TYPES_CHILD = "types"
+local TYPES_LOCAL = "Types"
+
+--> Readers own their cursors and hand them back, writers keep the buffer Allocate returns
+local READ_PARAMETERS =
+	"RecieveBuffer: buffer, RecieveCursor: number, RecieveInstances: {Instance}, RecieveInstanceCursor: number"
+local READ_ARGUMENTS = "RecieveBuffer, RecieveCursor, RecieveInstances, RecieveInstanceCursor"
+local READ_CURSORS = "RecieveCursor, RecieveInstanceCursor"
+local WRITE_LOCALS = "local SendBuffer: buffer, SendOffset: number"
+
 local DIRECTIVES = {
 	"--!strict\n",
 	"--!native\n",
@@ -28,6 +40,7 @@ local DIRECTIVES = {
 	"--!nolint LocalShadow\n",
 	"--!nolint LocalUnused\n",
 	"--!nolint FunctionUnused\n",
+	"--!nolint ImportUnused\n",
 	"--#selene: allow(shadowing)\n",
 }
 local VERSION_HEADER = {
@@ -42,33 +55,55 @@ local EVENT_BODY = {
 	"local Size = buffer.len(RecieveBuffer)\n",
 }
 
+--> A table so part handlers can record the event with a field write instead of a call
 local SYNC_VALIDATION_BODY = {
-	`local SerdesEvent = "?"\n`,
+	`local Serdes = \{ Event = "?" \}\n`,
 	"local SerdesThread: thread?\n",
+}
+
+--> Everything a part module needs from the core, captured once when the core initialises it
+local RUNTIME_BINDINGS: { { string } } = {
+	{ "Allocate", "(Bytes: number) -> (number, buffer)" },
+	{ "Save", "() -> any" },
+	{ "Load", "(Save: any?) -> ()" },
+	{ "CurrentInstances", "() -> { Instance }" },
+	{ "CopySendBuffer", "() -> buffer" },
+	{ "Null", "any" },
+	{ "Events", "any" },
+	{ "Queue", "any" },
+	{ "Calls", "any" },
+	{ "Invoke", "() -> number" },
+	{ "Uninvoke", "() -> ()" },
+	{ "CreateQueue", "() -> any" },
+	{ "Pop", "(Queue: any) -> any" },
+	{ "Push", "(Queue: any, Value: any) -> ()" },
+	{ "Serdes", "{ Event: string }" },
+	{ "ReliableHandlers", "{ [number]: any }" },
+	{ "UnreliableHandlers", "{ [number]: any }" },
+}
+
+local CONTEXT_BINDINGS: { [string]: { { string } } } = {
+	Server = {
+		{ "PlayersMap", "{ [Player]: any }" },
+		{ "SendToAll", "() -> ()" },
+		{ "SendToList", "(List: { Player }) -> ()" },
+		{ "SendToAllExcept", "(Except: Player) -> ()" },
+		{ "SendUnreliable", "(Player: Player) -> ()" },
+		{ "SendUnreliableToAll", "() -> ()" },
+		{ "SendUnreliableToList", "(List: { Player }) -> ()" },
+		{ "SendUnreliableToAllExcept", "(Except: Player) -> ()" },
+	},
+	Client = {
+		{ "SendUnreliable", "() -> ()" },
+	},
 }
 
 local EVENT_SYNC_VALIDATION = {
 	`if SerdesThread and coroutine.status(SerdesThread) == "suspended" then\n`,
-	'\twarn(`[Blink]: Yielded in a Sync call. Event "{SerdesEvent}" uses a Sync call, consider using an Async call instead.`)\n',
+	'\twarn(`[Blink]: Yielded in a Sync call. Event "{Serdes.Event}" uses a Sync call, consider using an Async call instead.`)\n',
 	"\tcoroutine.close(SerdesThread)\n",
 	"end\n",
 	"SerdesThread = coroutine.running()\n",
-}
-
-local RELIABLE_BODY = {
-	Header = "local Buffer, Size, Instances = SendBuffer, SendCursor, SendInstances",
-	Body = {
-		"Load(PlayersMap[Player])\n",
-		"local Position = Allocate(Size)\n",
-		"buffer.copy(SendBuffer, Position, Buffer, 0, Size)\n",
-		"table.move(Instances, 1, #Instances, #SendInstances + 1, SendInstances)\n",
-		"PlayersMap[Player] = Save()\n",
-	},
-}
-
-local UNRELIABLE_BODY = {
-	"local Buffer = buffer.create(SendCursor)\n",
-	"buffer.copy(Buffer, 0, SendBuffer, 0, SendCursor)\n",
 }
 
 local IGNORED_TYPES_IN_SHARED = {
@@ -88,13 +123,36 @@ local Noop: Builder.Builder
 local Events: Builder.Builder
 local UserTypes: Builder.Builder
 local LuauTypes: Builder.Builder
-local Reliables: Blocks.Block
-local Unreliables: Blocks.Block
 local Return: Builder.Builder
 local Options: Parser.Options
 
 local Generators = {}
 local Declarations = {}
+
+--> One part module is emitted per .blink file, they share the core's state through Init(Runtime)
+type Part = {
+	Name: string,
+	BaseIndent: number,
+	Keys: { string },
+	Children: { string },
+	Serdes: Builder.Builder,
+	Init: Builder.Builder,
+	Api: Builder.Builder,
+	Noop: Builder.Builder,
+}
+
+local Part: Part?
+local Parts: { Part } = {}
+
+local function GetIndent(): number
+	return Util.GetScopeIndent(Scope) - (if Part then Part.BaseIndent else 1) + 1
+end
+
+local function RecordKey(Name: string, Indent: number)
+	if Part and Indent == 1 then
+		table.insert(Part.Keys, Name)
+	end
+end
 
 local Channels: { [string]: { Count: number, Listening: boolean } } = {
 	Reliable = { Count = 0, Listening = false },
@@ -104,6 +162,52 @@ local Channels: { [string]: { Count: number, Listening: boolean } } = {
 local Types = Prefabs.Types
 local Primitives = Prefabs.Primitives
 local Structures = Prefabs.Structures
+
+type IdType = { Prefab: Prefabs.TypePrefab, Bytes: number, Name: string }
+
+--> Ids are u8 unless a channel has more than 256 events, wider ids would not fit in a byte
+local IdTypes: { [string]: IdType } = {}
+
+local function CountChannels(Tree: { Parser.Declaration }, Counts: { [string]: number })
+	for _, Declaration in Tree do
+		if Declaration.Type == "Scope" then
+			CountChannels(Declaration.Value.Values, Counts)
+		elseif Declaration.Type == "Event" then
+			Counts[Declaration.Value.Type] += 1
+		elseif Declaration.Type == "Function" then
+			Counts.Reliable += 1
+		end
+	end
+end
+
+local function GetIdType(Count: number): IdType
+	if Count <= 256 then
+		return { Prefab = Types.u8, Bytes = 1, Name = "u8" }
+	elseif Count <= 65536 then
+		return { Prefab = Types.u16, Bytes = 2, Name = "u16" }
+	end
+
+	error(`Too many events in one channel: {Count}, at most 65536 are supported.`)
+end
+
+local function HandlerBlock(Reliability: string, Index: number): Blocks.Block
+	local Parameters = `{Context == "Server" and "Player: Player, " or ""}{READ_PARAMETERS}`
+	return Blocks.Function(`{Reliability}Handlers[{Index}]`, Parameters, "(number, number)", true)
+end
+
+local function PushHandler(Handler: Blocks.Block)
+	Handler:Return(READ_CURSORS)
+	Events.PushLines(Handler:End().Content, 0, 1)
+end
+
+local function LocaliseSendInstances(Content: { string })
+	for Index = 2, #Content do
+		if string.find(Content[Index], "SendInstances", 1, true) then
+			table.insert(Content, 2, "\tlocal SendInstances = CurrentInstances()\n")
+			return
+		end
+	end
+end
 
 local function IsValidIdentifier(Identifier: string): boolean
 	return Identifier:match("%a%w*") == Identifier
@@ -324,7 +428,7 @@ function Declarations.Event(Declaration: Parser.Event)
 	local IsPolling = (Value.Call == "Polling" or Options.UsePolling)
 	local IsSameContext = Value.From == Context
 
-	local Block = IsUnreliable and Unreliables or Reliables
+	local Block: Blocks.Block
 	local Channel = IsUnreliable and Channels.Unreliable or Channels.Reliable
 
 	local Index = Channel.Count
@@ -333,23 +437,31 @@ function Declarations.Event(Declaration: Parser.Event)
 
 	--> Data body
 	local Types, Values, Arguments, _ = "nil", "Value: nil", "Value", nil
-	local Read, Write = Generators.Event(Value.Data, Index, Identifier)
+	local Read, Write = Generators.Event(Value.Data, Index, Identifier, Reliability)
 
 	if Value.Data then
 		Types, Values, _, Arguments = Generators.LuauType(Value.Data :: Type, true)
 	end
 
+	--> Handlers decode in place, a separate reader would cost every message an extra call
+	local function DecodeInto(Handler: Blocks.Block)
+		if Value.Data then
+			Generators.UserType(Value.Data :: Type, Handler, Blocks.Block())
+		else
+			Handler:Line("local Value = nil")
+		end
+	end
+
 	if IsSameContext then
 		UserTypes.PushLines(Write, 1, 0)
-	else
-		UserTypes.PushLines(Read, 1, 0)
 	end
 
 	--> Return body
 	local Body = Builder.new()
-	local Indent = Util.GetScopeIndent(Scope)
+	local Indent = GetIndent()
 	local WriteEvent = `{Util.GetPath(Identifier, true, Scope)}({Arguments})`
 
+	RecordKey(Declaration.Name, Indent)
 	Body.Push(`{Declaration.Name} = \{`, 0, Indent)
 	Noop.Push(`{Declaration.Name} = \{`, 0, Indent)
 
@@ -357,24 +469,13 @@ function Declarations.Event(Declaration: Parser.Event)
 		local IsSync = (Value.Call == "SingleSync" or Value.Call == "ManySync")
 		local IsSingle = (Value.Call == "SingleSync" or Value.Call == "SingleAsync")
 
-		--> Create queue and event branch
+		--> Create queue and event handler
 		if not IsSingle then
-			Events.Push(`{Connection} = \{}`)
+			Events.Push(`{Connection} = \{}`, 0, 1)
 		end
 
-		Events.Push(`{Queue} = table.create(256)`)
-		Block = (Channel.Listening == false) and Block:Compare("Index", Index, "Equals")
-			or Block:Branch("Conditional", "Index", Index, "Equals")
-
-		--> Update event block to branch block
-		if IsUnreliable then
-			Unreliables = Block
-		else
-			Reliables = Block
-		end
-
-		--> Update channel status
-		Channel.Listening = true
+		Events.Push(`{Queue} = table.create(256)`, 0, 1)
+		Block = HandlerBlock(Reliability, Index)
 
 		--> Event recieve body
 		local Listener: Blocks.Block
@@ -384,7 +485,7 @@ function Declarations.Event(Declaration: Parser.Event)
 		local CallListener = Blocks.Block()
 		do
 			if IsSync and Options.SyncValidation then
-				CallListener = CallListener:Line(`SerdesEvent = "{Declaration.Name}"`)
+				CallListener = CallListener:Line(`Serdes.Event = "{Declaration.Name}"`)
 			end
 
 			local PathExpr = IsSingle and Connection or "Listener"
@@ -393,7 +494,7 @@ function Declarations.Event(Declaration: Parser.Event)
 			CallListener = CallListener:Line(CallExpr)
 		end
 
-		Block:Line(`local {Values} = {Util.GetPath(Identifier, false, Scope)}()`)
+		DecodeInto(Block)
 
 		local Disconnect = Blocks.Function("", "", "()")
 		if IsSingle then
@@ -446,23 +547,15 @@ function Declarations.Event(Declaration: Parser.Event)
 				:End()
 		end
 
+		PushHandler(Block)
 		Noop.Push(`{Casing.On} = NOOP`, 0, Indent + 1)
 		Body.PushLines(Listener.Content, 0, Indent + 1)
 	elseif Value.From ~= Context and IsPolling then
-		Events.Push(`{Queue} = CreateQueue()`)
-		Block = (Channel.Listening == false) and Block:Compare("Index", Index, "Equals")
-			or Block:Branch("Conditional", "Index", Index, "Equals")
-
-		if IsUnreliable then
-			Unreliables = Block
-		else
-			Reliables = Block
-		end
-
-		Channel.Listening = true
-		Block:Line(
-			`Push({Queue}, table.pack({Context == "Server" and "Player, " or ""}{Util.GetPath(Identifier, false, Scope)}()))`
-		)
+		Events.Push(`{Queue} = CreateQueue()`, 0, 1)
+		Block = HandlerBlock(Reliability, Index)
+		DecodeInto(Block)
+		Block:Line(`Push({Queue}, table.pack({Context == "Server" and "Player, " or ""}{Arguments}))`)
+		PushHandler(Block)
 
 		local IterTypes = `number, {Context == "Server" and "Player, " or ""}{Types}`
 
@@ -503,9 +596,7 @@ function Declarations.Event(Declaration: Parser.Event)
 			Fire:Line(`local Previous = Save()`)
 			Fire:Line(`Load()`)
 			Fire:Line(WriteEvent)
-			Fire:Line("local Buffer = buffer.create(SendCursor)")
-			Fire:Line("buffer.copy(Buffer, 0, SendBuffer, 0, SendCursor)")
-			Fire:Line("Unreliable:FireServer(Buffer, SendInstances)")
+			Fire:Line("SendUnreliable()")
 			Fire:Line("Load(Previous)")
 		end
 		Fire:End()
@@ -521,61 +612,26 @@ function Declarations.Event(Declaration: Parser.Event)
 		else
 			Fire:Line("Load()")
 			Fire:Line(WriteEvent)
-			Fire:Lines(UNRELIABLE_BODY, 1)
-			Fire:Line("Unreliable:FireClient(Player, Buffer, SendInstances)")
+			Fire:Line("SendUnreliable(Player)")
 		end
 		Fire:End()
 
 		local FireAll = Blocks.Function(Casing.FireAll, Values, "()", true)
-		if IsReliable then
-			FireAll:Line("Load()")
-			FireAll:Line(WriteEvent)
-			FireAll:Line(RELIABLE_BODY.Header)
-			FireAll:Iterator("_", "Player", "Players:GetPlayers()"):Lines(RELIABLE_BODY.Body, 2):End()
-		else
-			FireAll:Line("Load()")
-			FireAll:Line(WriteEvent)
-			FireAll:Lines(UNRELIABLE_BODY, 1)
-			FireAll:Line("Unreliable:FireAllClients(Buffer, SendInstances)")
-		end
+		FireAll:Line("Load()")
+		FireAll:Line(WriteEvent)
+		FireAll:Line(IsReliable and "SendToAll()" or "SendUnreliableToAll()")
 		FireAll:End()
 
 		local FireList = Blocks.Function(Casing.FireList, `List: \{Player\}, {Values}`, "()", true)
-		if IsReliable then
-			FireList:Line("Load()")
-			FireList:Line(WriteEvent)
-			FireList:Line(RELIABLE_BODY.Header)
-			FireList:Iterator("_", "Player", "List"):Lines(RELIABLE_BODY.Body, 2):End()
-		else
-			FireList:Line("Load()")
-			FireList:Line(WriteEvent)
-			FireList:Lines(UNRELIABLE_BODY, 1)
-			FireList:Iterator("_", "Player", "List"):Line("Unreliable:FireClient(Player, Buffer, SendInstances)"):End()
-		end
+		FireList:Line("Load()")
+		FireList:Line(WriteEvent)
+		FireList:Line(IsReliable and "SendToList(List)" or "SendUnreliableToList(List)")
 		FireList:End()
 
 		local FireExcept = Blocks.Function(Casing.FireExcept, `Except: Player, {Values}`, "()", true)
-		if IsReliable then
-			FireExcept:Line("Load()")
-			FireExcept:Line(WriteEvent)
-			FireExcept:Line(RELIABLE_BODY.Header)
-			FireExcept:Iterator("_", "Player", "Players:GetPlayers()")
-				:Compare("Player", "Except", "Equals")
-				:Line("continue")
-				:End()
-				:Lines(RELIABLE_BODY.Body, 2)
-				:End()
-		else
-			FireExcept:Line("Load()")
-			FireExcept:Line(WriteEvent)
-			FireExcept:Lines(UNRELIABLE_BODY, 1)
-			FireExcept:Iterator("_", "Player", "Players:GetPlayers()")
-				:Compare("Player", "Except", "Equals")
-				:Line("continue")
-				:End()
-				:Line("Unreliable:FireClient(Player, Buffer, SendInstances)")
-				:End()
-		end
+		FireExcept:Line("Load()")
+		FireExcept:Line(WriteEvent)
+		FireExcept:Line(IsReliable and "SendToAllExcept(Except)" or "SendUnreliableToAllExcept(Except)")
 		FireExcept:End()
 
 		Noop.PushLines({
@@ -617,7 +673,6 @@ function Declarations.Function(Declaration: Parser.Function)
 		error(`Cannot use yield type: "Promise", without providing a path to the promise library.`)
 	end
 
-	local Block = Reliables
 	local Channel = Channels.Reliable
 
 	local Index = Channel.Count
@@ -637,8 +692,9 @@ function Declarations.Function(Declaration: Parser.Function)
 	end
 
 	do
-		local DataRead, DataWrite = Generators.Event(Value.Data :: Type, Index, DataIdentifier, "Data")
-		local ReturnRead, ReturnWrite = Generators.Event(Value.Return :: Type, Index, ReturnIdentifier, "Return")
+		local DataRead, DataWrite = Generators.Event(Value.Data :: Type, Index, DataIdentifier, "Reliable", "Data")
+		local ReturnRead, ReturnWrite =
+			Generators.Event(Value.Return :: Type, Index, ReturnIdentifier, "Reliable", "Return")
 
 		if Context == "Client" then
 			UserTypes.PushLines(DataWrite, 1, 0)
@@ -651,23 +707,21 @@ function Declarations.Function(Declaration: Parser.Function)
 
 	--> Main
 	local Body = Builder.new()
-	local Indent = Util.GetScopeIndent(Scope)
+	local Indent = GetIndent()
 
+	RecordKey(Name, Indent)
 	Noop.Push(`{Name} = \{`, 0, Indent)
 	Body.Push(`{Name} = \{`, 0, Indent)
 
-	--> Create queue and event branch
-	Events.Push(`{Queue} = table.create(256)`)
-	Block = (Channel.Listening == false) and Block:Compare("Index", Index, "Equals")
-		or Block:Branch("Conditional", "Index", Index, "Equals")
-
-	--> Update event block to branch block
-	Reliables = Block
+	--> Create queue and event handler
+	Events.Push(`{Queue} = table.create(256)`, 0, 1)
+	local Block = HandlerBlock("Reliable", Index)
 
 	if Context == "Server" then
 		--> Data recieve body
 		Types.u8.Read("InvocationIdentifier", Block)
-		Block:Line(`local {DataValues} = {Util.GetPath(DataIdentifier, false, Scope)}()`)
+		Block:Line(`local {DataValues}`)
+		Block:Line(`{READ_CURSORS}, {DataArguments} = {Util.GetPath(DataIdentifier, false, Scope)}({READ_ARGUMENTS})`)
 			:Compare(Connection, "nil", "Not")
 			:Line(`task.spawn({Connection}, Player, {DataArguments}, InvocationIdentifier)`)
 			:Branch("Default")
@@ -698,10 +752,10 @@ function Declarations.Function(Declaration: Parser.Function)
 				:Lines(Serialize.Content, 1)
 				:Line("Load(PlayersMap[Player])")
 				:Compare("Success", "true", "Not")
-				:Line("local Position = Allocate(3)")
-				:Line(`buffer.writeu8(SendBuffer, Position, {Index})`)
-				:Line(`buffer.writeu8(SendBuffer, Position + 1, InvocationIdentifier)`)
-				:Line(`buffer.writeu8(SendBuffer, Position + 2, 0)`)
+				:Line(`local Position, SendBuffer = Allocate({IdTypes.Reliable.Bytes + 2})`)
+				:Line(`buffer.write{IdTypes.Reliable.Name}(SendBuffer, Position, {Index})`)
+				:Line(`buffer.writeu8(SendBuffer, Position + {IdTypes.Reliable.Bytes}, InvocationIdentifier)`)
+				:Line(`buffer.writeu8(SendBuffer, Position + {IdTypes.Reliable.Bytes + 1}, 0)`)
 				:Line(`warn(\`"{Name}" encountered an error, \{Error\}\`)`)
 				:Branch("Default")
 				:Line(`{Util.GetPath(ReturnIdentifier, true, Scope)}({ReturnArguments}, InvocationIdentifier)`)
@@ -714,28 +768,50 @@ function Declarations.Function(Declaration: Parser.Function)
 			:Lines(FlushQueue.Content, 1)
 			:End()
 
+		PushHandler(Block)
 		Noop.Push(`{Casing.On} = NOOP`, 0, Indent + 1)
-		Body.PushLines(Listener.Content, 0, 2)
+		Body.PushLines(Listener.Content, 0, Indent + 1)
 	else
 		--> Return recieve body
-		local Deserialize = Blocks.Function("", "")
-			:Return(`{Util.GetPath(ReturnIdentifier, false, Scope)}()`)
-			:End()
-			:Wrap(`local Success, {ReturnArguments} = pcall(`, ")")
-
 		Types.u8.Read("InvocationIdentifier", Block)
-		Block:Lines(Deserialize.Content, Block.Indent + 1)
-		Block:Compare("Calls[InvocationIdentifier]", "nil", "Not")
+		Types.u8.Read("ServerSuccess", Block)
+
+		local Decoded = Block:Compare("ServerSuccess", "1", "Equals")
+		Decoded:Line(
+			`local Success, NextCursor, NextInstanceCursor, {ReturnArguments} = pcall({Util.GetPath(
+				ReturnIdentifier,
+				false,
+				Scope
+			)}, {READ_ARGUMENTS})`
+		)
+
+		--> A reply that fails to decode leaves the cursor unknown, so the rest of the packet is dropped
+		Decoded:Compare("Success", "true", "Equals")
+			:Line(`{READ_CURSORS} = NextCursor, NextInstanceCursor`)
+			:Branch("Default")
+			:Line("RecieveCursor = buffer.len(RecieveBuffer)")
+			:End()
+
+		Decoded:Compare("Calls[InvocationIdentifier]", "nil", "Not")
 			:Line(`task.spawn(Calls[InvocationIdentifier], Success, {ReturnArguments})`)
 			:Line("Calls[InvocationIdentifier] = nil")
 			:End()
+
+		Decoded:Branch("Default")
+			:Compare("Calls[InvocationIdentifier]", "nil", "Not")
+			:Line("task.spawn(Calls[InvocationIdentifier], false)")
+			:Line("Calls[InvocationIdentifier] = nil")
+			:End()
+			:End()
+
+		PushHandler(Block)
 
 		--> Function listener body
 		local Exhaust = Blocks
 			.Block()
 			:Compare("Calls[InvocationIdentifier]", "nil", "Not")
 			--> Fail instead of closing/cancelling the thread
-			:Line("Invocations -= 1")
+			:Line("Uninvoke()")
 			:Line('error("More than 256 calls are awaiting a response, this packet has been dropped.")')
 			:End()
 			.Content
@@ -790,7 +866,6 @@ function Declarations.Function(Declaration: Parser.Function)
 	end
 
 	Channel.Count += 1
-	Channel.Listening = true
 
 	Noop.Push(`\},`, 0, Indent)
 	Body.Push(`\},`, 0, Indent)
@@ -916,7 +991,9 @@ function Generators.LuauType(
 	local Export = Util.GetExportName(Declaration.Name, Scope)
 	local Returns = `{Prefix}Value`
 
-	if Declaration.Type == "Primitive" then
+	if Declaration.Reference then
+		Type = if Context == "Shared" then Declaration.Reference else `{TYPES_LOCAL}.{Declaration.Reference}`
+	elseif Declaration.Type == "Primitive" then
 		local Tokens = (Declaration :: Parser.Primitive).Tokens
 		local Primitive = Primitives[Tokens.Primitive.Value]
 		if type(Primitive.Type) == "function" then
@@ -1029,19 +1106,27 @@ function Generators.Type(Declaration: Type)
 		Generics = `<{table.concat(Types, ",")}>`
 	end
 
+	--> Client and server re-export the definitions from their types child
+	if Context ~= "Shared" then
+		LuauTypes.Push(`export type {Export}{Generics} = {TYPES_LOCAL}.{Export}{Generics}`, 0, 0)
+		return
+	end
+
 	--> Write luau export
 	LuauTypes.PushMultiline(`export type {Export}{Generics} = {Type}`, 1, 0)
 end
 
 function Generators.Export(Declaration: Type)
 	local Name = Declaration.Name
-	local _, Values, Export, Returns = Generators.LuauType(Declaration)
+	local _, _, Export, Returns = Generators.LuauType(Declaration)
+	local TypeName = if Context == "Shared" then Export else `{TYPES_LOCAL}.{Export}`
 
-	local Read = Blocks.Function(Casing.Read, "Buffer: buffer", `({Export})`, true)
-	local Write = Blocks.Function(Casing.Write, `{Values}`, `(buffer)`, true)
+	local Read = Blocks.Function(Casing.Read, "Buffer: buffer", `({TypeName})`, true)
+	local Write = Blocks.Function(Casing.Write, `Value: {TypeName}`, `(buffer)`, true)
 
 	local Body = Builder.new()
-	local Indent = Util.GetScopeIndent(Scope)
+	local Indent = GetIndent()
+	RecordKey(Name, Indent)
 	Body.Push(`{Name} = \{`, 0, Indent)
 
 	--> Overwrite buffer
@@ -1049,14 +1134,11 @@ function Generators.Export(Declaration: Type)
 	Write:Comment("Buffer overwrite")
 
 	Read:Lines({
-		"local PreviousCursor = RecieveCursor\n",
-		"local PreviousBuffer = RecieveBuffer\n",
-		"local PreviousInstanceCursor = RecieveInstanceCursor\n",
-		"RecieveCursor = 0\n",
-		"RecieveBuffer = Buffer\n",
+		"local RecieveBuffer, RecieveCursor, RecieveInstances, RecieveInstanceCursor = Buffer, 0, {}, 0\n",
 	}, 1)
 
 	Write:Lines({
+		`{WRITE_LOCALS}\n`,
 		"local Previous = Save()\n",
 		"Load()\n",
 	}, 1)
@@ -1071,19 +1153,10 @@ function Generators.Export(Declaration: Type)
 	Generators.UserType(Declaration, Read, Write)
 
 	--> Restore buffer
-	Read:Comment("Buffer restore")
 	Write:Comment("Buffer restore")
 
-	Read:Lines({
-		"RecieveCursor = PreviousCursor\n",
-		"RecieveBuffer = PreviousBuffer\n",
-		"RecieveInstanceCursor = PreviousInstanceCursor\n",
-	}, 1)
-
 	--> Trim buffer
-	Write:Line("local Result = buffer.create(SendCursor)")
-	Write:Line("buffer.copy(Result, 0, SendBuffer, 0, SendCursor)")
-
+	Write:Line("local Result = CopySendBuffer()")
 	Write:Line(`Load(Previous)`)
 
 	--> End export
@@ -1092,6 +1165,7 @@ function Generators.Export(Declaration: Type)
 
 	Read:End():Wrap("", ",")
 	Write:End()
+	LocaliseSendInstances(Write.Content)
 
 	Body.PushLines(Read.Content, 0, Indent + 1)
 	Body.PushLines(Write.Content, 0, Indent + 1)
@@ -1107,6 +1181,7 @@ function Generators.Event(
 	Data: Type?,
 	Index: number,
 	Identifier: string,
+	Reliability: string,
 	Function: ("Data" | "Return")?
 ): ({ string }, { string })
 	local Type, Values, _, Returns = "nil", "Value: nil", nil, "nil"
@@ -1115,20 +1190,22 @@ function Generators.Event(
 	end
 
 	local Arguments = `{Values}{Function and ", InvocationIdentifier: number" or ""}`
-	local Read = Blocks.Function(Util.GetPath(Identifier, false, Scope), "", `({Type})`)
+	local Read = Blocks.Function(Util.GetPath(Identifier, false, Scope), READ_PARAMETERS, `(number, number, {Type})`)
 	local Write = Blocks.Function(Util.GetPath(Identifier, true, Scope), Arguments, "()")
+
+	Write:Line(WRITE_LOCALS)
+	Write:Advance(1)
 
 	if not _G.RELEASE then
 		Write:Comment(`{Identifier} ({Index})`)
 	end
 
-	Types.u8.Write(Index, Write)
+	IdTypes[Reliability].Prefab.Write(tostring(Index), Write)
 	if Function then
 		Types.u8.Write("InvocationIdentifier", Write)
+		--> The success byte is read by the caller, so a failed call never reads past its 3 byte reply
 		if Function == "Return" then
 			Types.u8.Write("1", Write)
-			Types.u8.Read("Success", Read)
-			Read:Compare("Success", "1", "Not"):Line('error("Server encountered an error.")'):End()
 		end
 	end
 
@@ -1136,7 +1213,48 @@ function Generators.Event(
 		Generators.UserType(Data, Read, Write)
 	end
 
-	return Read:Return(Returns):End().Content, Write:End().Content
+	local WriteContent = Write:End().Content
+	LocaliseSendInstances(WriteContent)
+
+	return Read:Return(`{READ_CURSORS}, {Returns}`):End().Content, WriteContent
+end
+
+function Generators.Part(Name: string, Tree: { Parser.Declaration }): Part
+	if Name == TYPES_CHILD or Name == "init" then
+		error(`A .blink file can't be named "{Name}", the name is reserved by the generated modules.`)
+	end
+
+	for _, Existing in Parts do
+		if Existing.Name == Name then
+			error(`Two .blink files map to the module name "{Name}", rename one of them or its import.`)
+		end
+	end
+
+	local NewPart: Part = {
+		Name = Name,
+		BaseIndent = Util.GetScopeIndent(Scope),
+		Keys = {},
+		Children = {},
+		Serdes = Builder.new(),
+		Init = Builder.new(),
+		Api = Builder.new(),
+		Noop = Builder.new(),
+	}
+
+	table.insert(Parts, NewPart)
+
+	local PreviousPart = Part
+	local PreviousSerdes, PreviousInit, PreviousApi, PreviousNoop = UserTypes, Events, Return, Noop
+
+	Part = NewPart
+	UserTypes, Events, Return, Noop = NewPart.Serdes, NewPart.Init, NewPart.Api, NewPart.Noop
+
+	Generators.AbstractSyntaxTree(Tree)
+
+	Part = PreviousPart
+	UserTypes, Events, Return, Noop = PreviousSerdes, PreviousInit, PreviousApi, PreviousNoop
+
+	return NewPart
 end
 
 function Generators.Scope(Declaration: Parser.ScopeNode)
@@ -1145,10 +1263,22 @@ function Generators.Scope(Declaration: Parser.ScopeNode)
 
 	local Parent = Scope
 	local NewScope = Value.Scope
+	local Indent = GetIndent()
 
-	local Path = Util.GetScopePrefix(NewScope, true, Scope)
-	local Indent = (#string.split(Path, ".") - 1)
-	Path = string.sub(Path, 1, #Path - 1)
+	RecordKey(Name, Indent)
+
+	--> Imported files become their own part, nested under the importing part
+	if Value.Import and Part then
+		local Owner = Part
+		Scope = NewScope
+		local Child = Generators.Part(string.sub(Util.GetScopePrefix(NewScope, false, NewScope), 1, -2), Value.Values)
+		Scope = Parent
+
+		table.insert(Owner.Children, Child.Name)
+		Noop.Push(`{Name} = Part_{Child.Name}.Noop,`, 0, Indent)
+		Return.Push(`{Name} = Part_{Child.Name}.Api,`, 0, Indent)
+		return
+	end
 
 	Scope = NewScope
 	Noop.Push(`{Name} = \{`, 0, Indent)
@@ -1193,122 +1323,194 @@ function Generator.Reset()
 	LuauTypes = Builder.new()
 	Return = Builder.new()
 
+	Part = nil
+	Parts = {}
+
 	--> Reset channels
 	Channels.Reliable.Count = 0
 	Channels.Unreliable.Count = 0
-	Channels.Reliable.Listening = false
-	Channels.Unreliable.Listening = false
 end
 
-function Generator.Generate(FileContext: Context, AbstractSyntaxTree: Parser.Body): string
-	local Imports = Builder.new()
+local function PartLocal(Name: string): string
+	return `Part_{string.gsub(Name, "[^%w_]", "_")}`
+end
 
+local function RequirePart(Parent: string, Name: string): string
+	return `local {PartLocal(Name)} = require({Parent}:FindFirstChild("{Name}"))\n`
+end
+
+local function GetBindings(): { { string } }
+	local Bindings = {}
+	for _, Binding in RUNTIME_BINDINGS do
+		if Binding[1] == "Serdes" and not Options.SyncValidation then
+			continue
+		end
+
+		table.insert(Bindings, Binding)
+	end
+
+	for _, Binding in CONTEXT_BINDINGS[Context] do
+		table.insert(Bindings, Binding)
+	end
+
+	return Bindings
+end
+
+local function ReceiveLoop(Reliability: string, Signal: string): { string }
+	local Arguments = (Context == "Server" and "Player: Player, " or "") .. "Buffer: buffer, Instances: {Instance}"
+	local Connection = Blocks.Connection(`{Reliability}.{Signal}`, Arguments)
+
+	Connection:Lines(EVENT_BODY, 1)
+	if Options.SyncValidation then
+		Connection:Lines(EVENT_SYNC_VALIDATION, 1)
+	end
+
+	--> Handlers decode synchronously and in buffer order, exactly like the single module's branches did
+	local Loop = Connection:While("RecieveCursor < Size")
+	IdTypes[Reliability].Prefab.Read("Index", Loop)
+	Loop:Line(`local Handler = {Reliability}Handlers[Index]`)
+	Loop:Compare("Handler", "nil", "Not")
+		:Line(`{READ_CURSORS} = Handler({Context == "Server" and "Player, " or ""}{READ_ARGUMENTS})`)
+		:End()
+
+	return Loop:End():End().Content
+end
+
+local function GeneratePart(Target: Part, Bindings: { { string } }): string
+	local Header = {
+		`local {TYPES_LOCAL} = require(script.Parent.{TYPES_CHILD})\n`,
+	}
+
+	if Options.FutureLibrary then
+		table.insert(Header, `local Future = require({Options.FutureLibrary})\n`)
+	end
+
+	if Options.PromiseLibrary then
+		table.insert(Header, `local Promise = require({Options.PromiseLibrary})\n`)
+	end
+
+	for _, Child in Target.Children do
+		table.insert(Header, RequirePart("script.Parent", Child))
+	end
+
+	table.insert(Header, "\n")
+	for _, Binding in Bindings do
+		table.insert(Header, `local {Binding[1]}: {Binding[2]}\n`)
+	end
+
+	table.insert(Header, "\nlocal NOOP = function() end\n")
+	table.insert(Header, "local SerdesFunctions = {}\n")
+
+	local Init = { "local function Init(Runtime: any)\n" }
+	for _, Binding in Bindings do
+		table.insert(Init, `\t{Binding[1]} = Runtime.{Binding[1]}\n`)
+	end
+
+	local Children = {}
+	for _, Child in Target.Children do
+		table.insert(Children, `\t{PartLocal(Child)}.Init(Runtime)\n`)
+	end
+
+	return table.concat(Table.Merge(
+		DIRECTIVES,
+		VERSION_HEADER,
+		Header,
+		Target.Serdes.DumpLines(),
+		{ "\nlocal Api = {\n" },
+		Target.Api.DumpLines(),
+		{ "}\n\nlocal Noop = {\n" },
+		Target.Noop.DumpLines(),
+		{ "}\n\n" },
+		Init,
+		Target.Init.DumpLines(),
+		Children,
+		{ "end\n\nreturn {\n\tApi = Api,\n\tNoop = Noop,\n\tInit = Init,\n}\n" }
+	))
+end
+
+--> Returns the source of every module of a side, keyed by module name, the core module is keyed "init"
+function Generator.Generate(FileContext: Context, AbstractSyntaxTree: Parser.Body, RootName: string): { [string]: string }
 	Generator.Reset()
 	Context = FileContext
 	Options = AbstractSyntaxTree.Value.Options
 	Casing = Settings.GetCasing((Options.Casing :: Settings.Case) or "Pascal")
 
-	--> Setup noop
-	Noop.Push(`if not RunService:IsRunning() then`)
-	Noop.Push(`local NOOP = function() end`, 0, 1)
-	Noop.Push(`local Returns = table.freeze(\{`, 0, 1)
+	local Counts = { Reliable = 0, Unreliable = 0 }
+	CountChannels(AbstractSyntaxTree.Value.Declarations, Counts)
+	IdTypes.Reliable = GetIdType(Counts.Reliable)
+	IdTypes.Unreliable = GetIdType(Counts.Unreliable)
 
-	--> Setup remote events
-	local Signal = Context == "Client" and "OnClientEvent" or "OnServerEvent"
-	local Arguments = (Context == "Server" and "Player: Player, " or "") .. "Buffer: buffer, Instances: {Instance}"
+	--> Parse declarations into parts
+	local Root = Generators.Part(RootName, AbstractSyntaxTree.Value.Declarations)
+	local Bindings = GetBindings()
+	local RootLocal = PartLocal(Root.Name)
 
-	Reliables = Blocks.Connection(`Reliable.{Signal}`, Arguments)
-	Unreliables = Blocks.Connection(`Unreliable.{Signal}`, Arguments)
-
-	Reliables:Lines(EVENT_BODY, 1)
-	Unreliables:Lines(EVENT_BODY, 1)
-
-	if Options.SyncValidation then
-		Reliables:Lines(EVENT_SYNC_VALIDATION, 1)
-		Unreliables:Lines(EVENT_SYNC_VALIDATION, 1)
-	end
-
-	Reliables = Reliables:While("RecieveCursor < Size")
-	Unreliables = Unreliables:While("RecieveCursor < Size")
-	Types.u8.Read("Index", Reliables)
-	Types.u8.Read("Index", Unreliables)
-
-	--> Import async libraries
-	if Options.FutureLibrary then
-		Imports.Push(`local Future = require({Options.FutureLibrary})`)
-	end
-
-	if Options.PromiseLibrary then
-		Imports.Push(`local Promise = require({Options.PromiseLibrary})`)
-	end
-
-	--> Replication
-	local Replication = Builder.new()
-	Return.Push(`{Casing.StepReplication} = StepReplication,`, 1, 1)
-
-	if not Options.ManualReplication then
-		Replication.Push("RunService.Heartbeat:Connect(StepReplication)")
-	end
-
-	--> Parse declarations
-	Generators.AbstractSyntaxTree(AbstractSyntaxTree.Value.Declarations)
-
-	--> Generate context source
+	--> Core
 	local Source = Sources[Context]
+	local Signal = Context == "Client" and "OnClientEvent" or "OnServerEvent"
+	local RemoteScope = Options.RemoteScope or "BLINK"
 
-	if Channels.Reliable.Listening then
-		Reliables = Reliables:End()
+	local Runtime = { "local Runtime = {\n" }
+	for _, Binding in Bindings do
+		table.insert(Runtime, `\t{Binding[1]} = {Binding[1]},\n`)
+	end
+	table.insert(Runtime, "}\n\n")
+
+	local NoopReturns = {
+		"if not RunService:IsRunning() then\n",
+		"\tlocal Returns = table.freeze({\n",
+	}
+
+	local Returns = {
+		"\nlocal Returns = table.freeze({\n",
+		`\t{Casing.StepReplication} = StepReplication,\n`,
+	}
+
+	for _, Key in Root.Keys do
+		table.insert(NoopReturns, `\t\t{FormatKey(Key)} = {RootLocal}.Noop{FormatIndex(Key)},\n`)
+		table.insert(Returns, `\t{FormatKey(Key)} = {RootLocal}.Api{FormatIndex(Key)},\n`)
 	end
 
-	if Channels.Unreliable.Listening then
-		Unreliables = Unreliables:End()
-	end
+	table.insert(NoopReturns, "\t})\n")
+	table.insert(NoopReturns, `\treturn Returns :: {EVENTS_TYPE}\n`)
+	table.insert(NoopReturns, "end\n")
+	table.insert(Returns, "})\n")
 
-	Reliables = Reliables:End():End()
-	Unreliables = Unreliables:End():End()
-
-	Noop.Push(`\})`, 0, 1)
-	Noop.Push(`return Returns :: {EVENTS_TYPE}`, 0, 1)
-	Noop.Push(`end`, 0, 0)
-
-	Return.PushFront(`\nlocal Returns = table.freeze(\{`)
-	Return.Push(`})`)
-
-	local ScopeValidationBody = {}
-	if Context ~= "Shared" then
-		local RemoteScope = Options.RemoteScope or "BLINK"
-		ScopeValidationBody = {
+	local Files: { [string]: string } = {}
+	Files.init = table.concat(Table.Merge(
+		DIRECTIVES,
+		VERSION_HEADER,
+		{
 			"_G._BLINK = _G._BLINK or {}\n",
 			`if _G._BLINK["{RemoteScope}"] then\n`,
 			`\terror("[Blink]: An instance of blink is already running with the remote scope \\"{RemoteScope}\\". Change the remote scope of either instance to avoid conflicts.")\n`,
 			"end\n",
 			`_G._BLINK["{RemoteScope}"] = true\n`,
-		}
-	end
-
-	local MergedOutput = Table.Merge(
-		DIRECTIVES,
-		VERSION_HEADER,
-		ScopeValidationBody,
+		},
 		string.split(Source[1], "\r"),
-		Imports.DumpLines(),
-		{ "local SerdesFunctions = {}\n" },
+		{ `local {TYPES_LOCAL} = require(script.{TYPES_CHILD})\n` },
+		LuauTypes.DumpLines(),
 		{ `local BASE_EVENT_NAME = "{Options.RemoteScope and Options.RemoteScope .. "_" or ""}BLINK"\n` },
 		string.split(Sources.Base, "\r"),
 		(if Options.SyncValidation then SYNC_VALIDATION_BODY else {}),
-		Events.DumpLines(),
-		LuauTypes.DumpLines(),
-		UserTypes.DumpLines(),
-		Noop.DumpLines(),
 		string.split(Source[2], "\r"),
-		Replication.DumpLines(),
-		Reliables.Content,
-		Unreliables.Content,
-		Return.DumpLines(),
+		{ "local ReliableHandlers = {}\n", "local UnreliableHandlers = {}\n\n" },
+		Runtime,
+		{ RequirePart("script", Root.Name), `{RootLocal}.Init(Runtime)\n\n` },
+		NoopReturns,
+		string.split(Source[3], "\r"),
+		{ if Options.ManualReplication then "" else "RunService.Heartbeat:Connect(StepReplication)\n" },
+		ReceiveLoop("Reliable", Signal),
+		ReceiveLoop("Unreliable", Signal),
+		Returns,
 		{ `type {EVENTS_TYPE} = typeof(Returns)\n`, `return Returns :: {EVENTS_TYPE}` }
-	)
+	))
 
-	return table.concat(MergedOutput)
+	for _, Target in Parts do
+		Files[Target.Name] = GeneratePart(Target, Bindings)
+	end
+
+	return Files
 end
 
 function Generator.GenerateShared(AbstractSyntaxTree: Parser.Body): string
@@ -1343,5 +1545,7 @@ end
 function Generator.GenerateTypescript(FileContext: Context, AbstractSyntaxTree: Parser.Body): string
 	return GenerateTypescript(FileContext, AbstractSyntaxTree)
 end
+
+Generator.TypesChild = TYPES_CHILD
 
 return Generator

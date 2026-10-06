@@ -74,7 +74,13 @@ function Block._operation(self: Block, Method: Method, Bytes: number): string
 		local Variable = `OFFSET_{Counts}`
 
 		Operation.Counts += 1
-		self:Line(`local {Variable} = {Method}({Bytes})`)
+		if Method == "Read" then
+			self:Line(`local {Variable} = RecieveCursor`)
+			self:Line(`RecieveCursor += {Bytes}`)
+		else
+			self:Line(`local {Variable}: number`)
+			self:Line(`{Variable}, SendBuffer = Allocate({Bytes})`)
+		end
 
 		return Variable
 	end
@@ -115,9 +121,17 @@ function Block._appendOperations(self: Block): Block
 		return self
 	end
 
-	local Append = `local {self.Unique} = {Operation.Method}({Operation.Bytes}{Variable and ` * {Variable}` or ""})`
+	local Size = `{Operation.Bytes}{Variable and ` * {Variable}` or ""}`
+	local Indent = self.Unique ~= DEFAULT_UNIQUE and self.Indent - 1 or self.Indent
 
-	self:_lineFront(Append, self.Unique ~= DEFAULT_UNIQUE and self.Indent - 1 or self.Indent)
+	--> Inserted at the same position, so lines are pushed in reverse order
+	if Operation.Method == "Read" then
+		self:_lineFront(`RecieveCursor += {Size}`, Indent)
+		self:_lineFront(`local {self.Unique} = RecieveCursor`, Indent)
+	else
+		self:_lineFront(`{self.Unique}, SendBuffer = Allocate({Size})`, Indent)
+		self:_lineFront(`local {self.Unique}: number`, Indent)
+	end
 	self:_lineFront(`-- {Operation.Method} BLOCK: {Operation.Bytes} bytes`)
 
 	return self

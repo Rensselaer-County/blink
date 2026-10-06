@@ -164,7 +164,7 @@ local function PlayTweens(Tweens: { [string]: Tween })
 	end
 end
 
-local function CreateModuleScript(Name: string, Source: string, Parent: Instance)
+local function CreateModuleScript(Name: string, Source: string, Parent: Instance): ModuleScript
 	local ModuleScript = Instance.new("ModuleScript")
 	ModuleScript.Name = Name
 	ModuleScript.Parent = Parent
@@ -173,6 +173,19 @@ local function CreateModuleScript(Name: string, Source: string, Parent: Instance
 	ScriptEditorService:UpdateSourceAsync(ModuleScript, function()
 		return Source
 	end)
+
+	return ModuleScript
+end
+
+local function CreateFolderModule(Name: string, Files: { [string]: string }, TypesSource: string, Parent: Instance)
+	local Core = CreateModuleScript(Name, Files.init, Parent)
+	CreateModuleScript(Generator.TypesChild, TypesSource, Core)
+
+	for PartName, Source in Files do
+		if PartName ~= "init" then
+			CreateModuleScript(PartName, Source, Core)
+		end
+	end
 end
 
 local function RequestScriptPermissions(): boolean
@@ -224,8 +237,8 @@ local function GenerateFile(File: StringValue, Directory: Instance)
 		return
 	end
 
-	local ServerSource = Generator.Generate("Server", AbstractSyntaxTree)
-	local ClientSource = Generator.Generate("Client", AbstractSyntaxTree)
+	local ServerFiles = Generator.Generate("Server", AbstractSyntaxTree, File.Name)
+	local ClientFiles = Generator.Generate("Client", AbstractSyntaxTree, File.Name)
 	local TypesSource = Generator.GenerateShared(AbstractSyntaxTree)
 
 	local BlinkFolder: Folder = Directory:FindFirstChild("Blink") :: Folder
@@ -241,8 +254,8 @@ local function GenerateFile(File: StringValue, Directory: Instance)
 
 	--> Generate output files
 	CreateModuleScript("Types", TypesSource, BlinkFolder)
-	CreateModuleScript("Server", ServerSource, BlinkFolder)
-	CreateModuleScript("Client", ClientSource, BlinkFolder)
+	CreateFolderModule("Server", ServerFiles, TypesSource, BlinkFolder)
+	CreateFolderModule("Client", ClientFiles, TypesSource, BlinkFolder)
 end
 
 local function LoadFile(File: StringValue)

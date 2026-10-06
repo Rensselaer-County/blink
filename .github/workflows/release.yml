@@ -1,15 +1,16 @@
 name: Release
 
 on:
-  release:
-    types:
-      - published
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
 
 env:
   GH_TOKEN: ${{github.token}}
+  TAG: ${{github.ref_name}}
 
 jobs:
   build:
@@ -17,35 +18,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Setup rokit
         uses: CompeyDev/setup-rokit@v0.1.0
-
-      - name: Setup pesde
-        uses: axiom-co/setup-pesde@v0.4.1
-        with:
-          token: ${{ secrets.PESDE_TOKEN }}
 
       - name: Build binaries
         run: lune run build
 
+      - name: Create release
+        run: gh release create "$TAG" --title "$TAG" --generate-notes
+
       - name: linux-aarch64
-        run: gh release upload ${{github.event.release.tag_name}} release/blink-linux-aarch64.tar.xz
+        run: gh release upload "$TAG" release/blink-linux-aarch64.tar.xz
 
       - name: linux-x86_64
-        run: gh release upload ${{github.event.release.tag_name}} release/blink-linux-x86_64.tar.xz
+        run: gh release upload "$TAG" release/blink-linux-x86_64.tar.xz
 
       - name: macos-aarch64
-        run: gh release upload ${{github.event.release.tag_name}} release/blink-macos-aarch64.tar.xz
+        run: gh release upload "$TAG" release/blink-macos-aarch64.tar.xz
 
       - name: macos-x86_64
-        run: gh release upload ${{github.event.release.tag_name}} release/blink-macos-x86_64.tar.xz
+        run: gh release upload "$TAG" release/blink-macos-x86_64.tar.xz
 
       - name: windows-x86_64
-        run: gh release upload ${{github.event.release.tag_name}} release/blink-windows-x86_64.tar.gz
+        run: gh release upload "$TAG" release/blink-windows-x86_64.tar.gz
 
       - name: plugin
-        run: gh release upload ${{github.event.release.tag_name}} release/blink-plugin.rbxm
-      
-      - name: pesde
-        run: pesde publish -y
+        run: gh release upload "$TAG" release/blink-plugin.rbxm
